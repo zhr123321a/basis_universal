@@ -65,7 +65,69 @@ namespace basisu
 	// pRGBAPixels: Pointer to source 4x4 block of RGBA pixels (R first in memory).
 	// block: Reference to destination UASTC block.
 	// level: Controls compression speed vs. performance tradeoff.
-	void encode_uastc(const uint8_t* pRGBAPixels, basist::uastc_block& output_block, uint32_t flags = cPackUASTCLevelDefault);
+	struct uastc_encode_profile
+	{
+		double input_analysis_ms = 0.0;
+		double candidate_generation_ms = 0.0;
+		double candidate_scoring_ms = 0.0;
+		double hint_generation_ms = 0.0;
+		double pack_ms = 0.0;
+		double total_ms = 0.0;
+	};
+
+	// Optional per-block search control used by DASTC-U1's memory-of-past
+	// training policy. The override is intersected with the modes enabled by
+	// the selected UASTC effort level and the block's RGB/RGBA/LA class. If the
+	// intersection is empty, the encoder safely falls back to the normal full
+	// search for that block.
+	struct uastc_encode_options
+	{
+		bool use_mode_mask_override = false;
+		uint32_t mode_mask_override = UINT32_MAX;
+
+		// ASTC-only consumers do not use the BC1, ETC1, or EAC
+		// transcoding hints embedded in the UASTC intermediate. Keep all
+		// selected ASTC data unchanged while writing deterministic legal
+		// placeholder hint bits.
+		bool skip_transcoding_hints = false;
+	};
+
+	struct uastc_encode_feedback
+	{
+		struct mode_config
+		{
+			bool valid = false;
+			uint8_t common_pattern = 0;
+			uint8_t ccs = 0;
+			uint16_t partition_seed = 0;
+			uint8_t endpoints[18] = {};
+			uint8_t weights[32] = {};
+			uint8_t solid_color[4] = {};
+		};
+
+		uint32_t selected_mode = UINT32_MAX;
+		uint32_t evaluated_mode_mask = 0;
+		bool mode_mask_fallback = false;
+		uint64_t mode_astc_error[basist::TOTAL_UASTC_MODES];
+		mode_config mode_configs[basist::TOTAL_UASTC_MODES];
+
+		uastc_encode_feedback()
+		{
+			for (uint32_t mode = 0; mode < basist::TOTAL_UASTC_MODES; ++mode)
+			{
+				mode_astc_error[mode] = UINT64_MAX;
+				mode_configs[mode] = mode_config{};
+			}
+		}
+	};
+
+	void encode_uastc(
+		const uint8_t* pRGBAPixels,
+		basist::uastc_block& output_block,
+		uint32_t flags = cPackUASTCLevelDefault,
+		uastc_encode_profile* profile = nullptr,
+		const uastc_encode_options* options = nullptr,
+		uastc_encode_feedback* feedback = nullptr);
 
 	struct uastc_encode_results
 	{

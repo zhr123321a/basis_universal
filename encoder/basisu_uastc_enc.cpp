@@ -16,6 +16,8 @@
 #include "basisu_gpu_texture.h"
 #include "basisu_bc7enc.h"
 
+#include <chrono>
+
 #ifdef _DEBUG
 // When BASISU_VALIDATE_UASTC_ENC is 1, we pack and unpack to/from UASTC and ASTC, then validate that each codec returns the exact same results. This is slower.
 #define BASISU_VALIDATE_UASTC_ENC 1
@@ -3123,14 +3125,32 @@ namespace basisu
 		return 1.0f;
 	}
 
-	void encode_uastc(const uint8_t* pRGBAPixels, uastc_block& output_block, uint32_t flags)
+	void encode_uastc(
+		const uint8_t* pRGBAPixels,
+		uastc_block& output_block,
+		uint32_t flags,
+		uastc_encode_profile* profile,
+		const uastc_encode_options* options,
+		uastc_encode_feedback* feedback)
 	{
+		using profile_clock = std::chrono::steady_clock;
+		if (profile)
+			*profile = uastc_encode_profile{};
+		if (feedback)
+			*feedback = uastc_encode_feedback{};
+		const profile_clock::time_point total_begin = profile ? profile_clock::now() : profile_clock::time_point{};
+		auto record_profile = [&](const profile_clock::time_point& begin, double& destination) {
+			if (profile)
+				destination = std::chrono::duration<double, std::milli>(profile_clock::now() - begin).count();
+		};
+		profile_clock::time_point stage_begin = total_begin;
 //		printf("encode_uastc: \n");
 //		for (int i = 0; i < 16; i++)
 //			printf("[%u %u %u %u] ", pRGBAPixels[i * 4 + 0], pRGBAPixels[i * 4 + 1], pRGBAPixels[i * 4 + 2], pRGBAPixels[i * 4 + 3]);
 //		printf("\n");
 
 		const color_rgba(*block)[4] = reinterpret_cast<const color_rgba(*)[4]>(pRGBAPixels);
+		const bool skip_transcoding_hints = options && options->skip_transcoding_hints;
 
 		bool solid_color = true, has_alpha = false, is_la = true;
 
@@ -3149,6 +3169,8 @@ namespace basisu
 					is_la = false;
 			}
 		}
+		if (profile)
+			record_profile(stage_begin, profile->input_analysis_ms);
 
 		if (solid_color)
 		{
@@ -3160,16 +3182,40 @@ namespace basisu
 			solid_results.m_solid_color = first_color;
 			memset(&solid_results.m_astc, 0, sizeof(solid_results.m_astc));
 						
+			stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 			etc_block etc1_blk;
 			uint32_t etc1_bias = 0;
 
-			pack_etc1_block_solid_color(etc1_blk, &first_color.m_comps[0]);
+			if (skip_transcoding_hints)
+				memset(&etc1_blk, 0, sizeof(etc1_blk));
+			else
+				pack_etc1_block_solid_color(etc1_blk, &first_color.m_comps[0]);
 
 			eac_a8_block eac_a8_blk;
 			eac_a8_blk.m_table = 0;
 			eac_a8_blk.m_multiplier = 1;
+			if (profile)
+				record_profile(stage_begin, profile->hint_generation_ms);
 
+			stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 			pack_uastc(output_block, solid_results, etc1_blk, etc1_bias, eac_a8_blk, false, false);
+			if (feedback)
+			{
+				feedback->selected_mode = UASTC_MODE_INDEX_SOLID_COLOR;
+				feedback->evaluated_mode_mask = 1U << UASTC_MODE_INDEX_SOLID_COLOR;
+				feedback->mode_astc_error[UASTC_MODE_INDEX_SOLID_COLOR] = 0;
+				auto& config = feedback->mode_configs[UASTC_MODE_INDEX_SOLID_COLOR];
+				config.valid = true;
+				config.solid_color[0] = first_color.r;
+				config.solid_color[1] = first_color.g;
+				config.solid_color[2] = first_color.b;
+				config.solid_color[3] = first_color.a;
+			}
+			if (profile)
+			{
+				record_profile(stage_begin, profile->pack_ms);
+				record_profile(total_begin, profile->total_ms);
+			}
 
 //			printf(" Solid\n");
 
@@ -3275,7 +3321,24 @@ namespace basisu
 		}
 
 		const bool try_alpha_modes = has_alpha || always_try_alpha_modes;
-		
+		if (options && options->use_mode_mask_override)
+		{
+			uint32_t applicable_mode_mask = 0;
+			if (is_la)
+				applicable_mode_mask |= (1U << 15) | (1U << 16) | (1U << 17);
+			if (!has_alpha)
+				applicable_mode_mask |= 0xFFU | (1U << 18);
+			if (try_alpha_modes)
+				applicable_mode_mask |= (1U << 9) | (1U << 10) | (1U << 11) |
+					(1U << 12) | (1U << 13) | (1U << 14);
+			const uint32_t restricted_mask = mode_mask & applicable_mode_mask &
+				options->mode_mask_override;
+			if (restricted_mask)
+				mode_mask = restricted_mask;
+			else if (feedback)
+				feedback->mode_mask_fallback = true;
+		}
+		stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 		bc7enc_compress_block_params comp_params;
 		memset(&comp_params, 0, sizeof(comp_params));
 		comp_params.m_max_partitions_mode1 = 64;
@@ -3350,7 +3413,15 @@ namespace basisu
 		}
 
 		assert(total_results);
+		if (feedback)
+		{
+			for (uint32_t result_index = 0; result_index < total_results; ++result_index)
+				feedback->evaluated_mode_mask |= 1U << results[result_index].m_uastc_mode;
+		}
+		if (profile)
+			record_profile(stage_begin, profile->candidate_generation_ms);
 		
+		stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 		// Fix up the errors so we consistently have LA, RGB, or RGBA error.
 		for (uint32_t i = 0; i < total_results; i++)
 		{
@@ -3381,6 +3452,24 @@ namespace basisu
 						total_err += color_distance_la(unpacked_block[j], ((const color_rgba*)block)[j]);
 
 					r.m_astc_err = total_err;
+				}
+			}
+		}
+		if (feedback)
+		{
+			for (uint32_t result_index = 0; result_index < total_results; ++result_index)
+			{
+				const uastc_encode_results& result = results[result_index];
+				if (result.m_astc_err < feedback->mode_astc_error[result.m_uastc_mode])
+				{
+					feedback->mode_astc_error[result.m_uastc_mode] = result.m_astc_err;
+					auto& config = feedback->mode_configs[result.m_uastc_mode];
+					config.valid = true;
+					config.common_pattern = static_cast<uint8_t>(result.m_common_pattern);
+					config.ccs = static_cast<uint8_t>(result.m_astc.m_ccs);
+					config.partition_seed = static_cast<uint16_t>(result.m_astc.m_partition_seed);
+					memcpy(config.endpoints, result.m_astc.m_endpoints, sizeof(config.endpoints));
+					memcpy(config.weights, result.m_astc.m_weights, sizeof(config.weights));
 				}
 			}
 		}
@@ -3550,12 +3639,16 @@ namespace basisu
 
 		const uastc_encode_results& best_results = results[best_index];
 		const uint32_t best_mode = best_results.m_uastc_mode;
+		if (feedback)
+			feedback->selected_mode = best_mode;
 		const astc_block_desc& best_astc_results = best_results.m_astc;
 				
 		color_rgba decoded_uastc_block[4][4];
 		bool success = unpack_uastc(best_mode, best_results.m_common_pattern, best_results.m_solid_color.get_color32(), best_astc_results, (basist::color32 *)&decoded_uastc_block[0][0], false);
 		(void)success;
 		VALIDATE(success);
+		if (profile)
+			record_profile(stage_begin, profile->candidate_scoring_ms);
 
 #if BASISU_VALIDATE_UASTC_ENC
 		// Make sure that the UASTC block unpacks to the same exact pixels as the ASTC block does, using two different decoders.
@@ -3604,39 +3697,58 @@ namespace basisu
 		}
 #endif
 
-		// Compute BC1 hints
+		// Compute cross-format transcoding hints. The ASTC-only path can skip
+		// this work because transcode_uastc_to_astc() only consumes the ASTC
+		// configuration, endpoint, weight, partition, and selector fields.
+		stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 		bool bc1_hint0 = false, bc1_hint1 = false;
-		if (bc1_hints)
-			compute_bc1_hints(bc1_hint0, bc1_hint1, best_results, block, decoded_uastc_block);
-		
+
 		eac_a8_block eac_a8_blk;
-		if ((g_uastc_mode_has_alpha[best_mode]) && (best_mode != UASTC_MODE_INDEX_SOLID_COLOR))
-		{
-			// Compute ETC2 hints
-			uint8_t decoded_uastc_block_alpha[16];
-			for (uint32_t i = 0; i < 16; i++)
-				decoded_uastc_block_alpha[i] = decoded_uastc_block[i >> 2][i & 3].a;
-
-			uastc_pack_eac_a8_results eac8_a8_results;
-			memset(&eac8_a8_results, 0, sizeof(eac8_a8_results));
-			uastc_pack_eac_a8(eac8_a8_results, decoded_uastc_block_alpha, 16, 0, eac_a8_mul_search_rad, eac_a8_table_mask);
-						
-			// All we care about for hinting is the table and multiplier.
-			eac_a8_blk.m_table = eac8_a8_results.m_table;
-			eac_a8_blk.m_multiplier = eac8_a8_results.m_multiplier;
-		}
-		else
-		{
-			memset(&eac_a8_blk, 0, sizeof(eac_a8_blk));
-		}
-
-		// Compute ETC1 hints
+		memset(&eac_a8_blk, 0, sizeof(eac_a8_blk));
+		eac_a8_blk.m_multiplier = 1;
 		etc_block etc1_blk;
+		memset(&etc1_blk, 0, sizeof(etc1_blk));
 		uint32_t etc1_bias = 0;
-		compute_etc1_hints(etc1_blk, etc1_bias, best_results, block, decoded_uastc_block, level, flags);
+
+		if (!skip_transcoding_hints)
+		{
+			if (bc1_hints)
+				compute_bc1_hints(bc1_hint0, bc1_hint1, best_results, block, decoded_uastc_block);
+
+			if ((g_uastc_mode_has_alpha[best_mode]) && (best_mode != UASTC_MODE_INDEX_SOLID_COLOR))
+			{
+				// Compute ETC2 hints
+				uint8_t decoded_uastc_block_alpha[16];
+				for (uint32_t i = 0; i < 16; i++)
+					decoded_uastc_block_alpha[i] = decoded_uastc_block[i >> 2][i & 3].a;
+
+				uastc_pack_eac_a8_results eac8_a8_results;
+				memset(&eac8_a8_results, 0, sizeof(eac8_a8_results));
+				uastc_pack_eac_a8(eac8_a8_results, decoded_uastc_block_alpha, 16, 0, eac_a8_mul_search_rad, eac_a8_table_mask);
+
+				// All we care about for hinting is the table and multiplier.
+				eac_a8_blk.m_table = eac8_a8_results.m_table;
+				eac_a8_blk.m_multiplier = eac8_a8_results.m_multiplier;
+			}
+			else
+			{
+				memset(&eac_a8_blk, 0, sizeof(eac_a8_blk));
+			}
+
+			// Compute ETC1 hints
+			compute_etc1_hints(etc1_blk, etc1_bias, best_results, block, decoded_uastc_block, level, flags);
+		}
+		if (profile)
+			record_profile(stage_begin, profile->hint_generation_ms);
 
 		// Finally, pack the UASTC block with its hints and we're done.
+		stage_begin = profile ? profile_clock::now() : profile_clock::time_point{};
 		pack_uastc(output_block, best_results, etc1_blk, etc1_bias, eac_a8_blk, bc1_hint0, bc1_hint1);
+		if (profile)
+		{
+			record_profile(stage_begin, profile->pack_ms);
+			record_profile(total_begin, profile->total_ms);
+		}
 
 //		printf(" Packed: ");
 //		for (int i = 0; i < 16; i++)
@@ -4163,8 +4275,4 @@ namespace basisu
 		return status;
 	}
 } // namespace basisu
-
-
-
-
 
