@@ -3343,6 +3343,7 @@ namespace basisu
 		memset(&comp_params, 0, sizeof(comp_params));
 		comp_params.m_max_partitions_mode1 = 64;
 		comp_params.m_least_squares_passes = least_squares_passes;
+		comp_params.m_pca_power_iterations = options ? options->pca_power_iterations : 0;
 		comp_params.m_weights[0] = 1;
 		comp_params.m_weights[1] = 1;
 		comp_params.m_weights[2] = 1;
@@ -4275,4 +4276,3 @@ namespace basisu
 		return status;
 	}
 } // namespace basisu
-

@@ -90,6 +90,10 @@ namespace basisu
 		// selected ASTC data unchanged while writing deterministic legal
 		// placeholder hint bits.
 		bool skip_transcoding_hints = false;
+
+		// Optional DASTC-U1 robust PCA iteration count. Zero keeps the
+		// upstream encoder default.
+		uint32_t pca_power_iterations = 0;
 	};
 
 	struct uastc_encode_feedback

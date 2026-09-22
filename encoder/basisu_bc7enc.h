@@ -91,6 +91,10 @@ namespace basisu
 		bc7enc_bool m_perceptual;
 
 		uint32_t m_least_squares_passes;
+
+		// Optional DASTC-U1 override for the RGB covariance power iteration.
+		// Zero preserves the BasisU default of three iterations.
+		uint32_t m_pca_power_iterations;
 	};
 
 	uint64_t color_cell_compression(uint32_t mode, const color_cell_compressor_params* pParams, color_cell_compressor_results* pResults, const bc7enc_compress_block_params* pComp_params);

@@ -40,6 +40,13 @@ static inline float vec4F_dot(const bc7enc_vec4F*pLHS, const bc7enc_vec4F*pRHS) 
 static inline bc7enc_vec4F vec4F_mul(const bc7enc_vec4F*pLHS, float s) { bc7enc_vec4F res; vec4F_set(&res, pLHS->m_c[0] * s, pLHS->m_c[1] * s, pLHS->m_c[2] * s, pLHS->m_c[3] * s); return res; }
 static inline bc7enc_vec4F* vec4F_normalize_in_place(bc7enc_vec4F*pV) { float s = pV->m_c[0] * pV->m_c[0] + pV->m_c[1] * pV->m_c[1] + pV->m_c[2] * pV->m_c[2] + pV->m_c[3] * pV->m_c[3]; if (s != 0.0f) { s = 1.0f / sqrtf(s); pV->m_c[0] *= s; pV->m_c[1] *= s; pV->m_c[2] *= s; pV->m_c[3] *= s; } return pV; }
 
+// Match the CUDA robust-PCA path's explicitly rounded multiply/add sequence.
+// Volatile temporaries prevent host FMA contraction from changing endpoint
+// decisions at U8 quantization boundaries.
+static inline float dastc_u1_float_mul(float a, float b) { volatile float value = a * b; return value; }
+static inline float dastc_u1_float_add(float a, float b) { volatile float value = a + b; return value; }
+static inline float dastc_u1_float_sub(float a, float b) { volatile float value = a - b; return value; }
+
 // Precomputed weight constants used during least fit determination. For each entry in g_bc7_weights[]: w * w, (1.0f - w) * w, (1.0f - w) * (1.0f - w), w
 const float g_bc7_weights1x[2 * 4] = { 0.000000f, 0.000000f, 1.000000f, 0.000000f, 1.000000f, 0.000000f, 0.000000f, 1.000000f };
 
@@ -1425,7 +1432,54 @@ uint64_t color_cell_compression(uint32_t mode, const color_cell_compressor_param
 	meanColor = vec4F_mul(&meanColor, 1.0f / (float)(pParams->m_num_pixels * 255.0f));
 	vec4F_saturate_in_place(&meanColor);
 
-	if (pParams->m_has_alpha)
+	if (pComp_params->m_pca_power_iterations)
+	{
+		const uint32_t axis_components = pParams->m_has_alpha ? 4U : 3U;
+		float covariance[4][4] = {};
+		for (uint32_t i = 0; i < pParams->m_num_pixels; ++i)
+		{
+			float centered[4] = {};
+			for (uint32_t component = 0; component < axis_components; ++component)
+				centered[component] = dastc_u1_float_sub(
+					static_cast<float>(pParams->m_pPixels[i].m_c[component]),
+					meanColorScaled.m_c[component]);
+			for (uint32_t output_component = 0; output_component < axis_components; ++output_component)
+				for (uint32_t input_component = 0; input_component < axis_components; ++input_component)
+					covariance[output_component][input_component] = dastc_u1_float_add(
+						covariance[output_component][input_component],
+						dastc_u1_float_mul(centered[output_component], centered[input_component]));
+		}
+		uint32_t initial_component = 0;
+		for (uint32_t component = 1; component < axis_components; ++component)
+			if (covariance[component][component] > covariance[initial_component][initial_component])
+				initial_component = component;
+		vec4F_set_scalar(&axis, 0.0f);
+		axis.m_c[initial_component] = 1.0f;
+		for (uint32_t iteration = 0; iteration < pComp_params->m_pca_power_iterations; ++iteration)
+		{
+			float next[4] = {};
+			for (uint32_t output_component = 0; output_component < axis_components; ++output_component)
+				for (uint32_t input_component = 0; input_component < axis_components; ++input_component)
+					next[output_component] = dastc_u1_float_add(
+						next[output_component],
+						dastc_u1_float_mul(
+							covariance[output_component][input_component], axis.m_c[input_component]));
+			float length_squared = 0.0f;
+			for (uint32_t component = 0; component < axis_components; ++component)
+				length_squared = dastc_u1_float_add(
+					length_squared, dastc_u1_float_mul(next[component], next[component]));
+			if (length_squared <= 1.0e-20f)
+			{
+				vec4F_set_scalar(&axis, 0.0f);
+				axis.m_c[initial_component] = 1.0f;
+				break;
+			}
+			const float scale = 1.0f / sqrtf(length_squared);
+			for (uint32_t component = 0; component < axis_components; ++component)
+				axis.m_c[component] = dastc_u1_float_mul(next[component], scale);
+		}
+	}
+	else if (pParams->m_has_alpha)
 	{
 		// Use incremental PCA for RGBA PCA, because it's simple.
 		vec4F_set_scalar(&axis, 0.0f);
@@ -1461,7 +1515,9 @@ uint64_t color_cell_compression(uint32_t mode, const color_cell_compressor_param
 		}
 
 		float xr = .9f, xg = 1.0f, xb = .7f;
-		for (uint32_t iter = 0; iter < 3; iter++)
+		const uint32_t pca_iterations = pComp_params->m_pca_power_iterations
+			? pComp_params->m_pca_power_iterations : 3U;
+		for (uint32_t iter = 0; iter < pca_iterations; iter++)
 		{
 			float r = xr * cov[0] + xg * cov[1] + xb * cov[2];
 			float g = xr * cov[1] + xg * cov[3] + xb * cov[4];
